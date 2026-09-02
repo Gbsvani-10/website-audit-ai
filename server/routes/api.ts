@@ -1,26 +1,41 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { crawlAndAuditWebsite } from '../scanner/crawler.js';
 import { dbStore } from '../db/store.js';
 import { explainAccessibilityIssue, generateRemediationFix, queryAccessibilityAssistant } from '../services/aiService.js';
-import type { ScanDepth } from '../../src/types/index.js';
+import {
+  AuditException,
+  createInvalidUrlError,
+  formatErrorResponse,
+  normalizeToAuditException,
+  logServerException,
+} from '../utils/errors.js';
+import type { ScanDepth, FullScanReport, ApiErrorDetail, AuditErrorCode } from '../../src/types/index.js';
 
 export const apiRouter = Router();
 
 // In-progress scans map for live progress polling
-const activeScans = new Map<
-  string,
-  {
-    id: string;
-    targetUrl: string;
-    status: string;
-    progressPercent: number;
-    stepMessage: string;
-    logs: any[];
-    pagesDone: number;
-    totalPages: number;
-    error?: string;
-  }
->();
+interface ActiveScanRecord {
+  id: string;
+  targetUrl: string;
+  status: string;
+  progressPercent: number;
+  stepMessage: string;
+  stage: string;
+  logs: any[];
+  pagesDone: number;
+  totalPages: number;
+  error?: string;
+  errorCode?: AuditErrorCode;
+  errorDetail?: ApiErrorDetail;
+}
+
+const activeScans = new Map<string, ActiveScanRecord>();
+
+// Middleware: ensure JSON content-type header on all API responses
+apiRouter.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  next();
+});
 
 /**
  * POST /api/scans
@@ -29,21 +44,24 @@ const activeScans = new Map<
 apiRouter.post('/scans', async (req: Request, res: Response) => {
   try {
     const { url, depth = 'quick' } = req.body;
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({ error: 'A valid target URL is required.' });
+    if (!url || typeof url !== 'string' || url.trim().length === 0) {
+      const err = createInvalidUrlError('A valid target URL is required.', undefined, url);
+      return res.status(err.statusCode).json(formatErrorResponse(err, url));
     }
 
+    const trimmedUrl = url.trim();
     const scanDepth = (depth as ScanDepth) || 'quick';
     const tempId = `scan_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
     // Set initial active state
     activeScans.set(tempId, {
       id: tempId,
-      targetUrl: url,
+      targetUrl: trimmedUrl,
       status: 'initializing',
       progressPercent: 5,
-      stepMessage: 'Initializing scan engine & SSRF guard...',
-      logs: [{ timestamp: new Date().toISOString(), message: `Queued scan for ${url}`, type: 'info' }],
+      stepMessage: 'SSRF Security Validation: Initializing scan engine & security guard...',
+      stage: 'SSRF Security Validation',
+      logs: [{ timestamp: new Date().toISOString(), message: `Queued scan for ${trimmedUrl}`, type: 'info' }],
       pagesDone: 0,
       totalPages: scanDepth === 'quick' ? 1 : scanDepth === 'standard' ? 10 : 30,
     });
@@ -51,13 +69,14 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
     // Start asynchronous crawler
     (async () => {
       try {
-        const fullReport = await crawlAndAuditWebsite(url, {
+        const fullReport = await crawlAndAuditWebsite(trimmedUrl, {
           depth: scanDepth,
           onProgress: (p) => {
             const current = activeScans.get(tempId);
             if (current) {
               current.progressPercent = p.percent;
               current.stepMessage = p.stepMessage;
+              current.stage = p.stage || current.stage;
               current.logs.push(p.log);
               current.pagesDone = p.pagesDone;
               current.totalPages = p.totalPages;
@@ -77,27 +96,81 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
           current.stepMessage = 'Audit completed successfully';
         }
       } catch (scanErr: any) {
-        console.error('Scan execution error:', scanErr);
+        logServerException('Audit execution failed', scanErr, { scanId: tempId, targetUrl: trimmedUrl });
+        const auditErr = normalizeToAuditException(scanErr, 'DOM Extraction & Crawling', trimmedUrl);
+
         const current = activeScans.get(tempId);
         if (current) {
           current.status = 'failed';
-          current.error = scanErr.message || 'Audit execution failed.';
+          current.error = auditErr.userFriendlyMessage;
+          current.errorCode = auditErr.code;
+          current.errorDetail = auditErr.toErrorDetail();
+          current.stepMessage = `Scan failed: ${auditErr.userFriendlyMessage}`;
           current.logs.push({
             timestamp: new Date().toISOString(),
-            message: `Scan failed: ${scanErr.message || 'Internal error'}`,
+            message: `[${auditErr.code}] ${auditErr.userFriendlyMessage}`,
             type: 'error',
           });
+        }
+
+        // Save structured failed scan to store
+        try {
+          const domain = new URL(trimmedUrl.startsWith('http') ? trimmedUrl : `https://${trimmedUrl}`).hostname;
+          const failedReport: FullScanReport = {
+            id: tempId,
+            websiteId: `site_${domain.replace(/[^a-z0-9]/gi, '_')}`,
+            targetUrl: trimmedUrl,
+            domain,
+            status: 'failed',
+            progressPercent: 100,
+            currentStepMessage: `Scan failed: ${auditErr.userFriendlyMessage}`,
+            scanDepth,
+            createdAt: new Date().toISOString(),
+            completedAt: new Date().toISOString(),
+            durationMs: 0,
+            scores: {
+              accessibility: 0,
+              performance: 0,
+              seo: 0,
+              security: 0,
+              overallQuality: 0,
+              breakdown: {
+                critical: 0,
+                serious: 0,
+                moderate: 0,
+                minor: 0,
+                passedChecks: 0,
+                incompleteChecks: 0,
+              },
+            },
+            pages: [],
+            issues: [],
+            seoSummary: [],
+            perfSummary: [],
+            securitySummary: [],
+            logs: current?.logs || [
+              { timestamp: new Date().toISOString(), message: `[${auditErr.code}] ${auditErr.userFriendlyMessage}`, type: 'error' },
+            ],
+            errorMessage: auditErr.userFriendlyMessage,
+            errorCode: auditErr.code,
+            errorDetail: auditErr.toErrorDetail(),
+          };
+          dbStore.saveScan(failedReport);
+        } catch {
+          // ignore fallback domain extraction errors
         }
       }
     })();
 
     return res.status(202).json({
+      success: true,
       scanId: tempId,
       status: 'queued',
       message: 'Scan initiated successfully.',
     });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'Failed to start scan.' });
+    const auditErr = normalizeToAuditException(err, 'Initializing scan');
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
   }
 });
 
@@ -106,8 +179,13 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
  * Returns all past scans.
  */
 apiRouter.get('/scans', (req: Request, res: Response) => {
-  const scans = dbStore.getAllScans();
-  return res.json({ scans });
+  try {
+    const scans = dbStore.getAllScans();
+    return res.json({ success: true, scans });
+  } catch (err: any) {
+    const auditErr = normalizeToAuditException(err);
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
+  }
 });
 
 /**
@@ -117,32 +195,60 @@ apiRouter.get('/scans', (req: Request, res: Response) => {
 apiRouter.get('/scans/:scan_id', (req: Request, res: Response) => {
   const { scan_id } = req.params;
 
-  // Check finished store first
-  const stored = dbStore.getScan(scan_id);
-  if (stored) {
-    return res.json({ scan: stored, isComplete: true });
-  }
+  try {
+    // Check finished store first
+    const stored = dbStore.getScan(scan_id);
+    if (stored) {
+      return res.json({
+        success: true,
+        scan: stored,
+        isComplete: stored.status === 'completed' || stored.status === 'failed',
+        isFailed: stored.status === 'failed',
+      });
+    }
 
-  // Check active scans
-  const active = activeScans.get(scan_id);
-  if (active) {
-    return res.json({
-      scan: {
-        id: active.id,
-        targetUrl: active.targetUrl,
-        status: active.status,
-        progressPercent: active.progressPercent,
-        currentStepMessage: active.stepMessage,
-        logs: active.logs,
-        pagesDone: active.pagesDone,
-        totalPages: active.totalPages,
-        errorMessage: active.error,
-      },
-      isComplete: active.status === 'completed',
-    });
-  }
+    // Check active scans
+    const active = activeScans.get(scan_id);
+    if (active) {
+      const isFailed = active.status === 'failed';
+      const isComplete = active.status === 'completed' || isFailed;
 
-  return res.status(404).json({ error: `Scan "${scan_id}" not found.` });
+      return res.json({
+        success: true,
+        scan: {
+          id: active.id,
+          targetUrl: active.targetUrl,
+          status: active.status,
+          progressPercent: active.progressPercent,
+          currentStepMessage: active.stepMessage,
+          stage: active.stage,
+          logs: active.logs,
+          pagesDone: active.pagesDone,
+          totalPages: active.totalPages,
+          errorMessage: active.error,
+          errorCode: active.errorCode,
+          errorDetail: active.errorDetail,
+        },
+        isComplete,
+        isFailed,
+      });
+    }
+
+    return res.status(404).json(
+      formatErrorResponse(
+        new AuditException({
+          code: 'SERVER_ERROR',
+          statusCode: 404,
+          message: `Scan record "${scan_id}" was not found.`,
+          userFriendlyMessage: `Audit scan record "${scan_id}" was not found. It may have expired or been cleared.`,
+          suggestion: 'Start a new website scan from the dashboard.',
+        })
+      )
+    );
+  } catch (err: any) {
+    const auditErr = normalizeToAuditException(err);
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
+  }
 });
 
 /**
@@ -151,22 +257,39 @@ apiRouter.get('/scans/:scan_id', (req: Request, res: Response) => {
  */
 apiRouter.get('/scans/:scan_id/summary', (req: Request, res: Response) => {
   const { scan_id } = req.params;
-  const scan = dbStore.getScan(scan_id);
-  if (!scan) {
-    return res.status(404).json({ error: `Scan "${scan_id}" not found.` });
-  }
+  try {
+    const scan = dbStore.getScan(scan_id);
+    if (!scan) {
+      return res.status(404).json(
+        formatErrorResponse(
+          new AuditException({
+            code: 'SERVER_ERROR',
+            statusCode: 404,
+            message: `Scan "${scan_id}" not found.`,
+            userFriendlyMessage: `Scan report "${scan_id}" could not be located.`,
+          })
+        )
+      );
+    }
 
-  return res.json({
-    id: scan.id,
-    domain: scan.domain,
-    targetUrl: scan.targetUrl,
-    scores: scan.scores,
-    pagesCount: scan.pages.length,
-    issuesCount: scan.issues.length,
-    createdAt: scan.createdAt,
-    durationMs: scan.durationMs,
-    limitationsNotice: scan.limitationsNotice,
-  });
+    return res.json({
+      success: true,
+      id: scan.id,
+      domain: scan.domain,
+      targetUrl: scan.targetUrl,
+      status: scan.status,
+      scores: scan.scores,
+      pagesCount: scan.pages?.length || 0,
+      issuesCount: scan.issues?.length || 0,
+      createdAt: scan.createdAt,
+      durationMs: scan.durationMs,
+      limitationsNotice: scan.limitationsNotice,
+      errorDetail: scan.errorDetail,
+    });
+  } catch (err: any) {
+    const auditErr = normalizeToAuditException(err);
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
+  }
 });
 
 /**
@@ -177,41 +300,55 @@ apiRouter.get('/scans/:scan_id/issues', (req: Request, res: Response) => {
   const { scan_id } = req.params;
   const { severity, category, wcag, search, status } = req.query;
 
-  const scan = dbStore.getScan(scan_id);
-  if (!scan) {
-    return res.status(404).json({ error: `Scan "${scan_id}" not found.` });
+  try {
+    const scan = dbStore.getScan(scan_id);
+    if (!scan) {
+      return res.status(404).json(
+        formatErrorResponse(
+          new AuditException({
+            code: 'SERVER_ERROR',
+            statusCode: 404,
+            message: `Scan "${scan_id}" not found.`,
+            userFriendlyMessage: `Scan record "${scan_id}" not found.`,
+          })
+        )
+      );
+    }
+
+    let issues = [...(scan.issues || [])];
+
+    if (severity && typeof severity === 'string' && severity !== 'all') {
+      issues = issues.filter((i) => i.severity.toLowerCase() === severity.toLowerCase());
+    }
+
+    if (category && typeof category === 'string' && category !== 'all') {
+      issues = issues.filter((i) => i.category.toLowerCase() === category.toLowerCase());
+    }
+
+    if (wcag && typeof wcag === 'string' && wcag !== 'all') {
+      issues = issues.filter((i) => i.wcagLevel.toLowerCase() === wcag.toLowerCase());
+    }
+
+    if (status && typeof status === 'string' && status !== 'all') {
+      issues = issues.filter((i) => i.status === status);
+    }
+
+    if (search && typeof search === 'string') {
+      const q = search.toLowerCase();
+      issues = issues.filter(
+        (i) =>
+          i.title.toLowerCase().includes(q) ||
+          i.ruleId.toLowerCase().includes(q) ||
+          i.description.toLowerCase().includes(q) ||
+          i.wcagRef.toLowerCase().includes(q)
+      );
+    }
+
+    return res.json({ success: true, issues, totalCount: issues.length });
+  } catch (err: any) {
+    const auditErr = normalizeToAuditException(err);
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
   }
-
-  let issues = [...scan.issues];
-
-  if (severity && typeof severity === 'string' && severity !== 'all') {
-    issues = issues.filter((i) => i.severity.toLowerCase() === severity.toLowerCase());
-  }
-
-  if (category && typeof category === 'string' && category !== 'all') {
-    issues = issues.filter((i) => i.category.toLowerCase() === category.toLowerCase());
-  }
-
-  if (wcag && typeof wcag === 'string' && wcag !== 'all') {
-    issues = issues.filter((i) => i.wcagLevel.toLowerCase() === wcag.toLowerCase());
-  }
-
-  if (status && typeof status === 'string' && status !== 'all') {
-    issues = issues.filter((i) => i.status === status);
-  }
-
-  if (search && typeof search === 'string') {
-    const q = search.toLowerCase();
-    issues = issues.filter(
-      (i) =>
-        i.title.toLowerCase().includes(q) ||
-        i.ruleId.toLowerCase().includes(q) ||
-        i.description.toLowerCase().includes(q) ||
-        i.wcagRef.toLowerCase().includes(q)
-    );
-  }
-
-  return res.json({ issues, totalCount: issues.length });
 });
 
 /**
@@ -220,16 +357,30 @@ apiRouter.get('/scans/:scan_id/issues', (req: Request, res: Response) => {
  */
 apiRouter.get('/issues/:issue_id', (req: Request, res: Response) => {
   const { issue_id } = req.params;
-  const scans = dbStore.getAllScans();
+  try {
+    const scans = dbStore.getAllScans();
 
-  for (const s of scans) {
-    const found = s.issues.find((i) => i.id === issue_id);
-    if (found) {
-      return res.json({ issue: found, scanId: s.id, domain: s.domain });
+    for (const s of scans) {
+      const found = s.issues?.find((i) => i.id === issue_id);
+      if (found) {
+        return res.json({ success: true, issue: found, scanId: s.id, domain: s.domain });
+      }
     }
-  }
 
-  return res.status(404).json({ error: `Issue "${issue_id}" not found.` });
+    return res.status(404).json(
+      formatErrorResponse(
+        new AuditException({
+          code: 'AUDIT_ERROR',
+          statusCode: 404,
+          message: `Issue "${issue_id}" not found.`,
+          userFriendlyMessage: `Accessibility issue identifier "${issue_id}" was not found.`,
+        })
+      )
+    );
+  } catch (err: any) {
+    const auditErr = normalizeToAuditException(err);
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
+  }
 });
 
 /**
@@ -245,7 +396,7 @@ apiRouter.post('/issues/:issue_id/ai-explain', async (req: Request, res: Respons
     if (!targetIssue) {
       const scans = dbStore.getAllScans();
       for (const s of scans) {
-        const found = s.issues.find((i) => i.id === issue_id);
+        const found = s.issues?.find((i) => i.id === issue_id);
         if (found) {
           targetIssue = found;
           break;
@@ -254,13 +405,24 @@ apiRouter.post('/issues/:issue_id/ai-explain', async (req: Request, res: Respons
     }
 
     if (!targetIssue) {
-      return res.status(404).json({ error: 'Issue data not found for AI explanation.' });
+      return res.status(404).json(
+        formatErrorResponse(
+          new AuditException({
+            code: 'AUDIT_ERROR',
+            statusCode: 404,
+            message: 'Issue data not found for AI explanation.',
+            userFriendlyMessage: 'The selected accessibility issue could not be found to generate an AI explanation.',
+          })
+        )
+      );
     }
 
     const explanation = await explainAccessibilityIssue(targetIssue);
-    return res.json({ explanation });
+    return res.json({ success: true, explanation });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'AI Explanation failed.' });
+    logServerException('AI Explanation failure', err);
+    const auditErr = normalizeToAuditException(err, 'AI Explanation');
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
   }
 });
 
@@ -277,7 +439,7 @@ apiRouter.post('/issues/:issue_id/ai-fix', async (req: Request, res: Response) =
     if (!targetIssue) {
       const scans = dbStore.getAllScans();
       for (const s of scans) {
-        const found = s.issues.find((i) => i.id === issue_id);
+        const found = s.issues?.find((i) => i.id === issue_id);
         if (found) {
           targetIssue = found;
           break;
@@ -286,13 +448,24 @@ apiRouter.post('/issues/:issue_id/ai-fix', async (req: Request, res: Response) =
     }
 
     if (!targetIssue) {
-      return res.status(404).json({ error: 'Issue data not found for AI fix generation.' });
+      return res.status(404).json(
+        formatErrorResponse(
+          new AuditException({
+            code: 'AUDIT_ERROR',
+            statusCode: 404,
+            message: 'Issue data not found for AI fix generation.',
+            userFriendlyMessage: 'The selected accessibility issue could not be found to generate an automated fix.',
+          })
+        )
+      );
     }
 
     const remediation = await generateRemediationFix(targetIssue, framework, customSnippet);
-    return res.json({ remediation });
+    return res.json({ success: true, remediation });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'AI Fix generation failed.' });
+    logServerException('AI Fix generation failure', err);
+    const auditErr = normalizeToAuditException(err, 'AI Remediation');
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
   }
 });
 
@@ -303,14 +476,25 @@ apiRouter.post('/issues/:issue_id/ai-fix', async (req: Request, res: Response) =
 apiRouter.post('/ai/assistant', async (req: Request, res: Response) => {
   try {
     const { message, context } = req.body;
-    if (!message || typeof message !== 'string') {
-      return res.status(400).json({ error: 'Question message is required.' });
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+      return res.status(400).json(
+        formatErrorResponse(
+          new AuditException({
+            code: 'SERVER_ERROR',
+            statusCode: 400,
+            message: 'Question message is required.',
+            userFriendlyMessage: 'Please type a question to ask the accessibility specialist.',
+          })
+        )
+      );
     }
 
     const reply = await queryAccessibilityAssistant(message, context);
-    return res.json({ reply });
+    return res.json({ success: true, reply });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'AI Assistant failed.' });
+    logServerException('AI Assistant failure', err);
+    const auditErr = normalizeToAuditException(err, 'AI Specialist Assistant');
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
   }
 });
 
@@ -319,8 +503,13 @@ apiRouter.post('/ai/assistant', async (req: Request, res: Response) => {
  * Lists all audited websites.
  */
 apiRouter.get('/websites', (req: Request, res: Response) => {
-  const websites = dbStore.getAllWebsites();
-  return res.json({ websites });
+  try {
+    const websites = dbStore.getAllWebsites();
+    return res.json({ success: true, websites });
+  } catch (err: any) {
+    const auditErr = normalizeToAuditException(err);
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
+  }
 });
 
 /**
@@ -329,13 +518,27 @@ apiRouter.get('/websites', (req: Request, res: Response) => {
  */
 apiRouter.get('/websites/:website_id', (req: Request, res: Response) => {
   const { website_id } = req.params;
-  const site = dbStore.getWebsite(website_id);
-  if (!site) {
-    return res.status(404).json({ error: `Website "${website_id}" not found.` });
-  }
+  try {
+    const site = dbStore.getWebsite(website_id);
+    if (!site) {
+      return res.status(404).json(
+        formatErrorResponse(
+          new AuditException({
+            code: 'SERVER_ERROR',
+            statusCode: 404,
+            message: `Website "${website_id}" not found.`,
+            userFriendlyMessage: `Website profile "${website_id}" was not found in the database.`,
+          })
+        )
+      );
+    }
 
-  const scans = dbStore.getWebsiteScans(website_id);
-  return res.json({ website: site, scans });
+    const scans = dbStore.getWebsiteScans(website_id);
+    return res.json({ success: true, website: site, scans });
+  } catch (err: any) {
+    const auditErr = normalizeToAuditException(err);
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
+  }
 });
 
 /**
@@ -345,44 +548,68 @@ apiRouter.get('/websites/:website_id', (req: Request, res: Response) => {
 apiRouter.get('/scans/compare', (req: Request, res: Response) => {
   const { scanA: idA, scanB: idB } = req.query;
   if (!idA || !idB || typeof idA !== 'string' || typeof idB !== 'string') {
-    return res.status(400).json({ error: 'Both "scanA" and "scanB" query parameters are required.' });
+    return res.status(400).json(
+      formatErrorResponse(
+        new AuditException({
+          code: 'SERVER_ERROR',
+          statusCode: 400,
+          message: 'Both "scanA" and "scanB" query parameters are required.',
+          userFriendlyMessage: 'Please select two valid scan reports to compare.',
+        })
+      )
+    );
   }
 
-  const scanA = dbStore.getScan(idA);
-  const scanB = dbStore.getScan(idB);
+  try {
+    const scanA = dbStore.getScan(idA);
+    const scanB = dbStore.getScan(idB);
 
-  if (!scanA || !scanB) {
-    return res.status(404).json({ error: 'One or both specified scans were not found for comparison.' });
+    if (!scanA || !scanB) {
+      return res.status(404).json(
+        formatErrorResponse(
+          new AuditException({
+            code: 'SERVER_ERROR',
+            statusCode: 404,
+            message: 'One or both specified scans were not found for comparison.',
+            userFriendlyMessage: 'One or both selected scan reports could not be found.',
+          })
+        )
+      );
+    }
+
+    const scoreDelta = (scanB.scores?.overallQuality || 0) - (scanA.scores?.overallQuality || 0);
+    const a11yDelta = (scanB.scores?.accessibility || 0) - (scanA.scores?.accessibility || 0);
+
+    // Compare issues
+    const rulesA = new Map((scanA.issues || []).map((i) => [i.ruleId, i]));
+    const rulesB = new Map((scanB.issues || []).map((i) => [i.ruleId, i]));
+
+    const fixedIssues = (scanA.issues || []).filter((i) => !rulesB.has(i.ruleId));
+    const newIssues = (scanB.issues || []).filter((i) => !rulesA.has(i.ruleId));
+    const unchangedIssues = (scanB.issues || []).filter((i) => rulesA.has(i.ruleId));
+
+    const deltaBreakdown = {
+      critical: (scanB.scores?.breakdown?.critical || 0) - (scanA.scores?.breakdown?.critical || 0),
+      serious: (scanB.scores?.breakdown?.serious || 0) - (scanA.scores?.breakdown?.serious || 0),
+      moderate: (scanB.scores?.breakdown?.moderate || 0) - (scanA.scores?.breakdown?.moderate || 0),
+      minor: (scanB.scores?.breakdown?.minor || 0) - (scanA.scores?.breakdown?.minor || 0),
+    };
+
+    return res.json({
+      success: true,
+      scanA,
+      scanB,
+      scoreDelta,
+      a11yDelta,
+      deltaBreakdown,
+      fixedIssues,
+      newIssues,
+      unchangedIssues,
+    });
+  } catch (err: any) {
+    const auditErr = normalizeToAuditException(err);
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
   }
-
-  const scoreDelta = scanB.scores.overallQuality - scanA.scores.overallQuality;
-  const a11yDelta = scanB.scores.accessibility - scanA.scores.accessibility;
-
-  // Compare issues
-  const rulesA = new Map(scanA.issues.map((i) => [i.ruleId, i]));
-  const rulesB = new Map(scanB.issues.map((i) => [i.ruleId, i]));
-
-  const fixedIssues = scanA.issues.filter((i) => !rulesB.has(i.ruleId));
-  const newIssues = scanB.issues.filter((i) => !rulesA.has(i.ruleId));
-  const unchangedIssues = scanB.issues.filter((i) => rulesA.has(i.ruleId));
-
-  const deltaBreakdown = {
-    critical: scanB.scores.breakdown.critical - scanA.scores.breakdown.critical,
-    serious: scanB.scores.breakdown.serious - scanA.scores.breakdown.serious,
-    moderate: scanB.scores.breakdown.moderate - scanA.scores.breakdown.moderate,
-    minor: scanB.scores.breakdown.minor - scanA.scores.breakdown.minor,
-  };
-
-  return res.json({
-    scanA,
-    scanB,
-    scoreDelta,
-    a11yDelta,
-    deltaBreakdown,
-    fixedIssues,
-    newIssues,
-    unchangedIssues,
-  });
 });
 
 /**
@@ -390,8 +617,13 @@ apiRouter.get('/scans/compare', (req: Request, res: Response) => {
  * Lists scheduled monitoring tasks.
  */
 apiRouter.get('/monitoring', (req: Request, res: Response) => {
-  const monitors = dbStore.getAllScheduledMonitors();
-  return res.json({ monitors });
+  try {
+    const monitors = dbStore.getAllScheduledMonitors();
+    return res.json({ success: true, monitors });
+  } catch (err: any) {
+    const auditErr = normalizeToAuditException(err);
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
+  }
 });
 
 /**
@@ -400,12 +632,17 @@ apiRouter.get('/monitoring', (req: Request, res: Response) => {
  */
 apiRouter.post('/monitoring', (req: Request, res: Response) => {
   const { targetUrl, frequency = 'weekly', depth = 'standard', notifyEmail, alertThresholdScore = 80 } = req.body;
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'Target URL is required for monitoring.' });
+  if (!targetUrl || typeof targetUrl !== 'string' || targetUrl.trim().length === 0) {
+    return res.status(400).json(
+      formatErrorResponse(
+        createInvalidUrlError('Target URL is required for scheduled monitoring.', undefined, targetUrl)
+      )
+    );
   }
 
   try {
-    const domain = new URL(targetUrl.startsWith('http') ? targetUrl : `https://${targetUrl}`).hostname;
+    const formatted = targetUrl.startsWith('http') ? targetUrl : `https://${targetUrl}`;
+    const domain = new URL(formatted).hostname;
     const websiteId = `site_${domain.replace(/[^a-z0-9]/gi, '_')}`;
     const id = `monitor_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
 
@@ -413,7 +650,7 @@ apiRouter.post('/monitoring', (req: Request, res: Response) => {
       id,
       websiteId,
       domain,
-      targetUrl,
+      targetUrl: formatted,
       frequency,
       depth,
       nextRun: new Date(Date.now() + 7 * 86400000).toISOString(),
@@ -423,9 +660,13 @@ apiRouter.post('/monitoring', (req: Request, res: Response) => {
     };
 
     dbStore.saveScheduledMonitoring(newMonitor);
-    return res.status(201).json({ monitor: newMonitor, message: 'Scheduled monitoring enabled.' });
-  } catch {
-    return res.status(400).json({ error: 'Invalid URL provided.' });
+    return res.status(201).json({ success: true, monitor: newMonitor, message: 'Scheduled monitoring enabled.' });
+  } catch (err: any) {
+    return res.status(400).json(
+      formatErrorResponse(
+        createInvalidUrlError('Invalid target URL provided for scheduled monitoring.', err?.message, targetUrl)
+      )
+    );
   }
 });
 
@@ -435,9 +676,23 @@ apiRouter.post('/monitoring', (req: Request, res: Response) => {
  */
 apiRouter.delete('/monitoring/:id', (req: Request, res: Response) => {
   const { id } = req.params;
-  const deleted = dbStore.deleteScheduledMonitoring(id);
-  if (!deleted) {
-    return res.status(404).json({ error: `Monitor "${id}" not found.` });
+  try {
+    const deleted = dbStore.deleteScheduledMonitoring(id);
+    if (!deleted) {
+      return res.status(404).json(
+        formatErrorResponse(
+          new AuditException({
+            code: 'SERVER_ERROR',
+            statusCode: 404,
+            message: `Scheduled monitor "${id}" not found.`,
+            userFriendlyMessage: `Scheduled monitor "${id}" was not found.`,
+          })
+        )
+      );
+    }
+    return res.json({ success: true, message: 'Monitoring removed.' });
+  } catch (err: any) {
+    const auditErr = normalizeToAuditException(err);
+    return res.status(auditErr.statusCode).json(formatErrorResponse(auditErr));
   }
-  return res.json({ success: true, message: 'Monitoring removed.' });
 });

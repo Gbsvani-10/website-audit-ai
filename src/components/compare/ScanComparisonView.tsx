@@ -21,13 +21,14 @@ export const ScanComparisonView: React.FC<ScanComparisonViewProps> = ({
   scans,
   onOpenIssue,
 }) => {
-  const [scanAId, setScanAId] = useState<string>(scans[1]?.id || scans[0]?.id || '');
-  const [scanBId, setScanBId] = useState<string>(scans[0]?.id || '');
+  const completedScans = scans.filter((s) => s.status === 'completed' && s.scores);
+  const [scanAId, setScanAId] = useState<string>(completedScans[1]?.id || completedScans[0]?.id || '');
+  const [scanBId, setScanBId] = useState<string>(completedScans[0]?.id || '');
 
-  const scanA = scans.find((s) => s.id === scanAId) || scans[1] || scans[0];
-  const scanB = scans.find((s) => s.id === scanBId) || scans[0];
+  const scanA = completedScans.find((s) => s.id === scanAId) || completedScans[1] || completedScans[0];
+  const scanB = completedScans.find((s) => s.id === scanBId) || completedScans[0];
 
-  if (!scanA || !scanB || scans.length < 2) {
+  if (!scanA || !scanB || completedScans.length < 2) {
     return (
       <div className="p-8 text-center rounded-2xl bg-slate-900/80 border border-slate-800 text-slate-400">
         <GitCompare className="w-10 h-10 mx-auto text-slate-600 mb-3" aria-hidden="true" />
@@ -39,16 +40,16 @@ export const ScanComparisonView: React.FC<ScanComparisonViewProps> = ({
     );
   }
 
-  const scoreDelta = scanB.scores.overallQuality - scanA.scores.overallQuality;
-  const a11yDelta = scanB.scores.accessibility - scanA.scores.accessibility;
+  const scoreDelta = (scanB.scores?.overallQuality || 0) - (scanA.scores?.overallQuality || 0);
+  const a11yDelta = (scanB.scores?.accessibility || 0) - (scanA.scores?.accessibility || 0);
 
   // Compute issue diffs
-  const rulesA = new Map(scanA.issues.map((i) => [i.ruleId, i]));
-  const rulesB = new Map(scanB.issues.map((i) => [i.ruleId, i]));
+  const rulesA = new Map((scanA.issues || []).map((i) => [i.ruleId, i]));
+  const rulesB = new Map((scanB.issues || []).map((i) => [i.ruleId, i]));
 
-  const fixedIssues = scanA.issues.filter((i) => !rulesB.has(i.ruleId));
-  const newIssues = scanB.issues.filter((i) => !rulesA.has(i.ruleId));
-  const recurringIssues = scanB.issues.filter((i) => rulesA.has(i.ruleId));
+  const fixedIssues = (scanA.issues || []).filter((i) => !rulesB.has(i.ruleId));
+  const newIssues = (scanB.issues || []).filter((i) => !rulesA.has(i.ruleId));
+  const recurringIssues = (scanB.issues || []).filter((i) => rulesA.has(i.ruleId));
 
   return (
     <div className="space-y-6">

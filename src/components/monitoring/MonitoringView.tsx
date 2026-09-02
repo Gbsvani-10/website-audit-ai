@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Clock, Plus, Trash2, Bell, Globe, ShieldCheck, CheckCircle2 } from 'lucide-react';
 import type { ScheduledMonitoring } from '../../types/index.js';
+import { apiClient } from '../../utils/apiClient.js';
 
 interface MonitoringViewProps {
   onStartAudit: (url: string) => void;
@@ -17,10 +18,9 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({ onStartAudit }) 
 
   const fetchMonitors = async () => {
     try {
-      const res = await fetch('/api/monitoring');
-      const data = await res.json();
-      if (data.monitors) {
-        setMonitors(data.monitors);
+      const res = await apiClient.get<{ monitors: ScheduledMonitoring[] }>('/api/monitoring');
+      if (res.success && res.data?.monitors) {
+        setMonitors(res.data.monitors);
       }
     } catch (err) {
       console.error('Failed to fetch monitors:', err);
@@ -38,17 +38,13 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({ onStartAudit }) 
     if (!url.trim()) return;
 
     try {
-      const res = await fetch('/api/monitoring', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          targetUrl: url,
-          frequency,
-          notifyEmail: email || 'auditor@accessaudit.ai',
-          alertThresholdScore: threshold,
-        }),
+      const res = await apiClient.post('/api/monitoring', {
+        targetUrl: url,
+        frequency,
+        notifyEmail: email || 'auditor@accessaudit.ai',
+        alertThresholdScore: threshold,
       });
-      if (res.ok) {
+      if (res.success) {
         setUrl('');
         setShowAddModal(false);
         fetchMonitors();
@@ -60,7 +56,7 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({ onStartAudit }) 
 
   const handleDelete = async (id: string) => {
     try {
-      await fetch(`/api/monitoring/${id}`, { method: 'DELETE' });
+      await apiClient.delete(`/api/monitoring/${id}`);
       fetchMonitors();
     } catch (err) {
       console.error('Failed to delete monitor:', err);

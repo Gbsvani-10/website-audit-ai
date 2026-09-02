@@ -20,7 +20,9 @@ import type {
   AccessibilityIssue,
   ScanDepth,
   ScoreWeightsConfig,
+  ApiErrorDetail,
 } from './types/index.js';
+import { apiClient } from './utils/apiClient.js';
 
 import { SkipToContent } from './components/layout/SkipToContent.js';
 import { Navbar } from './components/layout/Navbar.js';
@@ -77,29 +79,33 @@ export function App() {
     logs: [] as any[],
     isComplete: false,
     error: undefined as string | undefined,
+    errorDetail: undefined as ApiErrorDetail | undefined,
     targetUrl: '',
+    depth: 'quick' as ScanDepth,
   });
 
   // Load initial scans and websites from backend
   const refreshData = useCallback(async () => {
     try {
       const [scansRes, sitesRes] = await Promise.all([
-        fetch('/api/scans'),
-        fetch('/api/websites'),
+        apiClient.get<{ scans: FullScanReport[] }>('/api/scans'),
+        apiClient.get<{ websites: WebsiteProfile[] }>('/api/websites'),
       ]);
 
-      const scansData = await scansRes.json();
-      const sitesData = await sitesRes.json();
-
-      if (scansData.scans) {
-        setScans(scansData.scans);
-        if (!currentScan && scansData.scans.length > 0) {
-          setCurrentScan(scansData.scans[0]);
+      if (scansRes.success && scansRes.data?.scans) {
+        setScans(scansRes.data.scans);
+        if (!currentScan && scansRes.data.scans.length > 0) {
+          const completedScans = scansRes.data.scans.filter((s) => s.status === 'completed');
+          if (completedScans.length > 0) {
+            setCurrentScan(completedScans[0]);
+          } else {
+            setCurrentScan(scansRes.data.scans[0]);
+          }
         }
       }
 
-      if (sitesData.websites) {
-        setWebsites(sitesData.websites);
+      if (sitesRes.success && sitesRes.data?.websites) {
+        setWebsites(sitesRes.data.websites);
       }
     } catch (err) {
       console.error('Failed to load initial data:', err);
@@ -112,47 +118,83 @@ export function App() {
 
   // Active scan polling loop
   useEffect(() => {
-    if (!activeScanId || scanProgress.isComplete) return;
+    if (!activeScanId || scanProgress.isComplete || scanProgress.error) return;
 
     const interval = setInterval(async () => {
       try {
-        const res = await fetch(`/api/scans/${activeScanId}`);
-        const data = await res.json();
+        const response = await apiClient.get<{ scan: any; isComplete: boolean; isFailed?: boolean }>(
+          `/api/scans/${activeScanId}`,
+          scanProgress.targetUrl
+        );
 
-        if (data.scan) {
+        if (!response.success && response.error) {
+          clearInterval(interval);
+          setScanProgress((prev) => ({
+            ...prev,
+            error: response.error?.userFriendlyMessage || 'Audit interrupted.',
+            errorDetail: response.error,
+            isComplete: false,
+          }));
+          return;
+        }
+
+        const data = response.data;
+        if (data && data.scan) {
           const s = data.scan;
+          const isFailed = data.isFailed || s.status === 'failed';
+          const isFinished = data.isComplete || s.status === 'completed' || isFailed;
+
+          if (isFailed) {
+            clearInterval(interval);
+            setScanProgress({
+              percent: s.progressPercent || 100,
+              message: s.currentStepMessage || 'Audit encountered an error.',
+              logs: s.logs || [],
+              isComplete: false,
+              error: s.errorMessage || s.errorDetail?.userFriendlyMessage || 'Audit scan failed.',
+              errorDetail: s.errorDetail,
+              targetUrl: s.targetUrl || scanProgress.targetUrl,
+              depth: scanProgress.depth,
+            });
+            refreshData();
+            return;
+          }
+
           setScanProgress({
             percent: s.progressPercent || 10,
             message: s.currentStepMessage || 'Inspecting DOM & WCAG rules...',
             logs: s.logs || [],
-            isComplete: data.isComplete || s.status === 'completed',
-            error: s.errorMessage,
-            targetUrl: s.targetUrl,
+            isComplete: isFinished,
+            error: undefined,
+            errorDetail: undefined,
+            targetUrl: s.targetUrl || scanProgress.targetUrl,
+            depth: scanProgress.depth,
           });
 
-          if (data.isComplete || s.status === 'completed') {
+          if (isFinished) {
             clearInterval(interval);
-            // Refresh data to fetch full completed scan report
-            const fullRes = await fetch(`/api/scans/${activeScanId}`);
-            const fullData = await fullRes.json();
-            if (fullData.scan) {
-              setCurrentScan(fullData.scan);
+            // Fetch full completed scan report
+            const fullRes = await apiClient.get<{ scan: FullScanReport }>(
+              `/api/scans/${activeScanId}`,
+              scanProgress.targetUrl
+            );
+            if (fullRes.success && fullRes.data?.scan) {
+              setCurrentScan(fullRes.data.scan);
               setActiveTab('overview');
-              // Celebrate high quality scores
-              if (fullData.scan.scores?.overallQuality >= 80) {
+              if (fullRes.data.scan.scores?.overallQuality >= 80) {
                 confetti({ particleCount: 60, spread: 70, origin: { y: 0.6 } });
               }
             }
             refreshData();
           }
         }
-      } catch (pollErr) {
-        console.warn('Scan polling error:', pollErr);
+      } catch (pollErr: any) {
+        console.warn('Scan polling non-fatal warning:', pollErr);
       }
     }, 1200);
 
     return () => clearInterval(interval);
-  }, [activeScanId, scanProgress.isComplete, refreshData]);
+  }, [activeScanId, scanProgress.isComplete, scanProgress.error, scanProgress.targetUrl, scanProgress.depth, refreshData]);
 
   // Handle starting a new audit
   const handleStartScan = async (targetUrl: string, depth: ScanDepth) => {
@@ -160,33 +202,43 @@ export function App() {
     setProgressModalOpen(true);
     setScanProgress({
       percent: 5,
-      message: 'Submitting URL to AccessAudit AI engine...',
+      message: 'SSRF Security Validation: Initializing scan engine & security guard...',
       logs: [{ timestamp: new Date().toISOString(), message: `Queueing ${targetUrl}`, type: 'info' }],
       isComplete: false,
       error: undefined,
+      errorDetail: undefined,
       targetUrl,
+      depth,
     });
 
     try {
-      const res = await fetch('/api/scans', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: targetUrl, depth }),
-      });
-      const data = await res.json();
-      if (data.scanId) {
-        setActiveScanId(data.scanId);
+      const result = await apiClient.post<{ scanId: string; success?: boolean; message?: string }>(
+        '/api/scans',
+        { url: targetUrl, depth },
+        targetUrl
+      );
+
+      if (result.success && result.data?.scanId) {
+        setActiveScanId(result.data.scanId);
       } else {
         setScanProgress((p) => ({
           ...p,
-          error: data.error || 'Failed to initialize scan.',
+          error: result.error?.userFriendlyMessage || 'Failed to initialize scan.',
+          errorDetail: result.error,
         }));
       }
     } catch (err: any) {
       setScanProgress((p) => ({
         ...p,
-        error: err.message || 'Network error.',
+        error: err.userFriendlyMessage || err.message || 'Network connection failed.',
+        errorDetail: err.toErrorDetail ? err.toErrorDetail() : undefined,
       }));
+    }
+  };
+
+  const handleRetryScan = () => {
+    if (scanProgress.targetUrl) {
+      handleStartScan(scanProgress.targetUrl, scanProgress.depth || 'quick');
     }
   };
 
@@ -574,6 +626,8 @@ export function App() {
         logs={scanProgress.logs}
         isComplete={scanProgress.isComplete}
         errorMessage={scanProgress.error}
+        errorDetail={scanProgress.errorDetail}
+        onRetry={handleRetryScan}
         onCancel={() => {
           setProgressModalOpen(false);
           setActiveScanId(null);

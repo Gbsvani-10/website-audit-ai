@@ -14,6 +14,7 @@ import {
   CheckSquare,
 } from 'lucide-react';
 import type { AccessibilityIssue, RemediationSuggestion } from '../../types/index.js';
+import { apiClient } from '../../utils/apiClient.js';
 import { SeverityBadge } from '../common/SeverityBadge.js';
 import { CodeBlock } from '../common/CodeBlock.js';
 
@@ -55,14 +56,12 @@ export const IssueDetailModal: React.FC<IssueDetailModalProps> = ({
     setFramework(selectedFramework);
     setLoadingAi(true);
     try {
-      const res = await fetch(`/api/issues/${issue.id}/ai-fix`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ framework: selectedFramework, issueData: issue }),
-      });
-      const data = await res.json();
-      if (data.remediation) {
-        setRemediation(data.remediation);
+      const res = await apiClient.post<{ remediation: RemediationSuggestion }>(
+        `/api/issues/${issue.id}/ai-fix`,
+        { framework: selectedFramework, issueData: issue }
+      );
+      if (res.success && res.data?.remediation) {
+        setRemediation(res.data.remediation);
       }
     } catch (err) {
       console.error('Failed to load AI fix:', err);
@@ -74,14 +73,12 @@ export const IssueDetailModal: React.FC<IssueDetailModalProps> = ({
   const generateAiExplanation = async () => {
     setLoadingAi(true);
     try {
-      const res = await fetch(`/api/issues/${issue.id}/ai-explain`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ issueData: issue }),
-      });
-      const data = await res.json();
-      if (data.explanation) {
-        setExplanation(data.explanation);
+      const res = await apiClient.post<{ explanation: any }>(
+        `/api/issues/${issue.id}/ai-explain`,
+        { issueData: issue }
+      );
+      if (res.success && res.data?.explanation) {
+        setExplanation(res.data.explanation);
       }
     } catch (err) {
       console.error('Failed to load AI explanation:', err);

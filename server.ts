@@ -1,9 +1,10 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { apiRouter } from './server/routes/api.js';
+import { formatErrorResponse, logServerException } from './server/utils/errors.js';
 
 dotenv.config();
 
@@ -18,13 +19,39 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/api', apiRouter);
 
 // Health check endpoint
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (req: Request, res: Response) => {
   res.json({
+    success: true,
     status: 'ok',
     service: 'AccessAudit AI Core Engine',
     timestamp: new Date().toISOString(),
     geminiConfigured: !!process.env.GEMINI_API_KEY,
   });
+});
+
+// 404 Handler for undefined API routes (always returns JSON)
+app.use('/api/*', (req: Request, res: Response) => {
+  res.status(404).json({
+    success: false,
+    error: {
+      code: 'SERVER_ERROR',
+      message: `API route not found: ${req.method} ${req.originalUrl}`,
+      userFriendlyMessage: 'The requested API endpoint was not found.',
+      statusCode: 404,
+      timestamp: new Date().toISOString(),
+    },
+  });
+});
+
+// Global API Error-Handling Middleware (catches any unhandled Express errors and ensures JSON output)
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  if (req.path.startsWith('/api')) {
+    logServerException(`Unhandled API Error on ${req.method} ${req.path}`, err);
+    const formatted = formatErrorResponse(err);
+    const status = err.statusCode || err.status || 500;
+    return res.status(status).json(formatted);
+  }
+  next(err);
 });
 
 async function startServer() {
@@ -37,7 +64,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (req: Request, res: Response) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

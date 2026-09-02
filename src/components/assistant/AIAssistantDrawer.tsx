@@ -12,6 +12,7 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import type { AccessibilityIssue, FullScanReport } from '../../types/index.js';
+import { apiClient } from '../../utils/apiClient.js';
 import { CodeBlock } from '../common/CodeBlock.js';
 
 interface AIAssistantDrawerProps {
@@ -70,21 +71,18 @@ export const AIAssistantDrawer: React.FC<AIAssistantDrawerProps> = ({
     setLoading(true);
 
     try {
-      const res = await fetch('/api/ai/assistant', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: textToSend,
-          context: {
-            currentUrl: currentScan?.targetUrl,
-            selectedIssue: selectedIssue || undefined,
-            scores: currentScan?.scores,
-          },
-        }),
+      const res = await apiClient.post<{ reply: string }>('/api/ai/assistant', {
+        message: textToSend,
+        context: {
+          currentUrl: currentScan?.targetUrl,
+          selectedIssue: selectedIssue || undefined,
+          scores: currentScan?.scores,
+        },
       });
 
-      const data = await res.json();
-      const reply = data.reply || 'No response from assistant.';
+      const reply = res.success && res.data?.reply
+        ? res.data.reply
+        : res.error?.userFriendlyMessage || 'No response from assistant.';
 
       const botMsg: ChatMessage = {
         id: `bot_${Date.now()}`,
@@ -100,7 +98,7 @@ export const AIAssistantDrawer: React.FC<AIAssistantDrawerProps> = ({
         {
           id: `bot_err_${Date.now()}`,
           sender: 'assistant',
-          text: `⚠️ Network error communicating with AI assistant: ${err.message || 'Please check your connection.'}`,
+          text: `⚠️ ${err.userFriendlyMessage || err.message || 'Error communicating with AI assistant.'}`,
           timestamp: new Date().toISOString(),
         },
       ]);

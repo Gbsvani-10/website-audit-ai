@@ -54,6 +54,9 @@ class InMemoryStore {
   }
 
   private updateWebsiteProfile(scan: FullScanReport) {
+    if (scan.status !== 'completed' || !scan.scores) {
+      return;
+    }
     let site = this.websites.get(scan.websiteId);
     if (!site) {
       site = {

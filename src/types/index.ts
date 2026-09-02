@@ -8,6 +8,36 @@ export type ScanStatus =
   | 'failed' 
   | 'cancelled';
 
+export type AuditErrorCode =
+  | 'INVALID_URL'
+  | 'SSRF_BLOCKED'
+  | 'TARGET_UNREACHABLE'
+  | 'TARGET_TIMEOUT'
+  | 'ACCESS_DENIED'
+  | 'BROWSER_ERROR'
+  | 'CRAWLER_ERROR'
+  | 'AUDIT_ERROR'
+  | 'SERVER_ERROR';
+
+export interface ApiErrorDetail {
+  code: AuditErrorCode;
+  message: string;
+  userFriendlyMessage: string;
+  suggestion?: string;
+  details?: string;
+  targetUrl?: string;
+  stage?: string;
+  statusCode: number;
+  timestamp: string;
+}
+
+export interface ApiResponse<T = any> {
+  success: boolean;
+  data?: T;
+  error?: ApiErrorDetail;
+  message?: string;
+}
+
 export type ScanDepth = 'quick' | 'standard' | 'deep';
 
 export type IssueSeverity = 'critical' | 'serious' | 'moderate' | 'minor';
@@ -144,6 +174,8 @@ export interface FullScanReport {
   securitySummary: SecurityObservation[];
   logs: ScanLogEntry[];
   errorMessage?: string;
+  errorCode?: AuditErrorCode;
+  errorDetail?: ApiErrorDetail;
   isDemo?: boolean;
   limitationsNotice?: string;
 }
