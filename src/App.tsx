@@ -212,14 +212,16 @@ export function App() {
     });
 
     try {
-      const result = await apiClient.post<{ scanId: string; success?: boolean; message?: string }>(
+      const result = await apiClient.post<{ scan_id?: string; scanId?: string; success?: boolean; message?: string }>(
         '/api/scans',
         { url: targetUrl, depth },
         targetUrl
       );
 
-      if (result.success && result.data?.scanId) {
-        setActiveScanId(result.data.scanId);
+      const returnedScanId = result.data?.scan_id || result.data?.scanId;
+
+      if (result.success && returnedScanId) {
+        setActiveScanId(returnedScanId);
       } else {
         setScanProgress((p) => ({
           ...p,

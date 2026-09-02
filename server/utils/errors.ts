@@ -62,14 +62,21 @@ export function getHttpStatusForCode(code: AuditErrorCode): number {
       return 400;
     case 'SSRF_BLOCKED':
       return 403;
+    case 'DNS_ERROR':
     case 'TARGET_UNREACHABLE':
+    case 'TARGET_HTTP_ERROR':
+    case 'TARGET_REDIRECT_ERROR':
       return 502;
     case 'TARGET_TIMEOUT':
       return 504;
     case 'ACCESS_DENIED':
       return 403;
+    case 'SCAN_NOT_FOUND':
+      return 404;
     case 'BROWSER_ERROR':
     case 'CRAWLER_ERROR':
+    case 'QUEUE_ERROR':
+    case 'DATABASE_ERROR':
     case 'AUDIT_ERROR':
     case 'SERVER_ERROR':
     default:
@@ -87,7 +94,7 @@ export function createInvalidUrlError(
     statusCode: 400,
     message,
     userFriendlyMessage: `The provided URL "${targetUrl || ''}" is malformed or uses an unsupported protocol.`,
-    suggestion: 'Please enter a valid, fully-qualified web address (e.g., https://example.com).',
+    suggestion: 'Please enter a valid, fully-qualified web address starting with https:// or http:// (e.g., https://example.com).',
     details,
     stage: 'SSRF Security Validation',
     targetUrl,
@@ -111,6 +118,23 @@ export function createSsrfBlockedError(
   });
 }
 
+export function createDnsError(
+  message: string,
+  details?: string,
+  targetUrl?: string
+): AuditException {
+  return new AuditException({
+    code: 'DNS_ERROR',
+    statusCode: 502,
+    message,
+    userFriendlyMessage: `Domain Name System (DNS) resolution failed for "${targetUrl || 'the host'}". The domain does not exist or DNS is unreachable.`,
+    suggestion: 'Verify that the domain name is spelled correctly and configured with active public DNS nameservers.',
+    details,
+    stage: 'SSRF Security Validation',
+    targetUrl,
+  });
+}
+
 export function createTargetUnreachableError(
   message: string,
   details?: string,
@@ -120,8 +144,8 @@ export function createTargetUnreachableError(
     code: 'TARGET_UNREACHABLE',
     statusCode: 502,
     message,
-    userFriendlyMessage: `Could not connect to "${targetUrl || 'the target website'}". The host is unreachable or DNS lookup failed.`,
-    suggestion: 'Verify that the target website is publicly online, accessible via HTTPS, and not blocking automated crawlers.',
+    userFriendlyMessage: `Could not connect to "${targetUrl || 'the target website'}". The host is unreachable, offline, or refusing connections.`,
+    suggestion: 'Verify that the target website is online in a public browser and accessible via standard HTTPS/HTTP ports.',
     details,
     stage: 'DOM Extraction & Crawling',
     targetUrl,
@@ -145,6 +169,46 @@ export function createTargetTimeoutError(
   });
 }
 
+export function createTargetHttpError(
+  httpStatus: number,
+  message: string,
+  details?: string,
+  targetUrl?: string
+): AuditException {
+  const is404 = httpStatus === 404;
+  return new AuditException({
+    code: 'TARGET_HTTP_ERROR',
+    statusCode: 502,
+    message,
+    userFriendlyMessage: is404
+      ? `The target website returned HTTP 404 (Not Found) and could not be audited.`
+      : `The target website returned HTTP ${httpStatus} error and could not complete audit.`,
+    suggestion: is404
+      ? 'Verify that the specific URL path exists on the website and is publicly reachable.'
+      : 'Check that the target website web server is operating without 5xx/4xx errors.',
+    details,
+    stage: 'DOM Extraction & Crawling',
+    targetUrl,
+  });
+}
+
+export function createTargetRedirectError(
+  message: string,
+  details?: string,
+  targetUrl?: string
+): AuditException {
+  return new AuditException({
+    code: 'TARGET_REDIRECT_ERROR',
+    statusCode: 502,
+    message,
+    userFriendlyMessage: `Target URL redirection error: either exceeded redirect limit or redirected to an unsafe/blocked address.`,
+    suggestion: 'Provide the direct final destination URL rather than an intermediary redirect link.',
+    details,
+    stage: 'DOM Extraction & Crawling',
+    targetUrl,
+  });
+}
+
 export function createAccessDeniedError(
   message: string,
   details?: string,
@@ -159,6 +223,51 @@ export function createAccessDeniedError(
     details,
     stage: 'DOM Extraction & Crawling',
     targetUrl,
+  });
+}
+
+export function createScanNotFoundError(
+  scanId: string
+): AuditException {
+  return new AuditException({
+    code: 'SCAN_NOT_FOUND',
+    statusCode: 404,
+    message: `Scan record "${scanId}" was not found.`,
+    userFriendlyMessage: `The requested audit scan record "${scanId}" could not be found. It may have expired or been cleared.`,
+    suggestion: 'Start a new website scan from the dashboard.',
+    stage: 'Report Finalization',
+  });
+}
+
+export function createQueueError(
+  message: string,
+  details?: string,
+  targetUrl?: string
+): AuditException {
+  return new AuditException({
+    code: 'QUEUE_ERROR',
+    statusCode: 500,
+    message,
+    userFriendlyMessage: 'The background audit worker queue encountered an internal error.',
+    suggestion: 'Please retry initiating the scan.',
+    details,
+    stage: 'Queue Dispatch',
+    targetUrl,
+  });
+}
+
+export function createDatabaseError(
+  message: string,
+  details?: string
+): AuditException {
+  return new AuditException({
+    code: 'DATABASE_ERROR',
+    statusCode: 500,
+    message,
+    userFriendlyMessage: 'The audit storage engine encountered a database operation failure.',
+    suggestion: 'Please refresh the dashboard or retry your operation.',
+    details,
+    stage: 'Persistence Store',
   });
 }
 
@@ -279,17 +388,55 @@ export function normalizeToAuditException(
     return createTargetTimeoutError(rawMsg, err?.stack, targetUrl);
   }
 
-  // DNS / Connection / Unreachable
+  // DNS Error
   if (
     errCode === 'ENOTFOUND' ||
+    rawMsg.includes('ENOTFOUND') ||
+    rawMsg.includes('getaddrinfo') ||
+    rawMsg.includes('Could not resolve domain') ||
+    rawMsg.includes('DNS resolution failed')
+  ) {
+    return createDnsError(rawMsg, err?.stack, targetUrl);
+  }
+
+  // Target HTTP Status Errors (404, 500, 502, 503 from target site)
+  if (
+    status === 404 ||
+    rawMsg.includes('HTTP 404') ||
+    rawMsg.includes('404 (Not Found)') ||
+    rawMsg.includes('The page could not be found') ||
+    rawMsg.includes('Page not found')
+  ) {
+    return createTargetHttpError(404, rawMsg, err?.stack, targetUrl);
+  }
+
+  if (
+    (status && status >= 400 && status !== 401 && status !== 403 && status !== 429) ||
+    rawMsg.includes('HTTP 500') ||
+    rawMsg.includes('HTTP 502') ||
+    rawMsg.includes('HTTP 503')
+  ) {
+    return createTargetHttpError(status || 500, rawMsg, err?.stack, targetUrl);
+  }
+
+  // Target Redirect Error
+  if (
+    rawMsg.includes('redirect') ||
+    rawMsg.includes('Redirect') ||
+    rawMsg.includes('too many redirects')
+  ) {
+    return createTargetRedirectError(rawMsg, err?.stack, targetUrl);
+  }
+
+  // Target Connection / Unreachable
+  if (
     errCode === 'ECONNREFUSED' ||
     errCode === 'EHOSTUNREACH' ||
     errCode === 'ENETUNREACH' ||
-    rawMsg.includes('ENOTFOUND') ||
+    errCode === 'ECONNRESET' ||
     rawMsg.includes('ECONNREFUSED') ||
+    rawMsg.includes('EHOSTUNREACH') ||
     rawMsg.includes('fetch failed') ||
-    rawMsg.includes('Could not resolve domain') ||
-    rawMsg.includes('Could not load') ||
     rawMsg.includes('The page cannot be loaded')
   ) {
     return createTargetUnreachableError(rawMsg, err?.stack, targetUrl);
@@ -306,6 +453,11 @@ export function normalizeToAuditException(
     rawMsg.includes('WAF')
   ) {
     return createAccessDeniedError(rawMsg, err?.stack, targetUrl);
+  }
+
+  // Scan Not Found
+  if (rawMsg.includes('Scan record') && rawMsg.includes('not found')) {
+    return createScanNotFoundError(targetUrl || 'unknown');
   }
 
   // Browser / axe-core

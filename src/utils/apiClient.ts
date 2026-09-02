@@ -317,8 +317,20 @@ function extractTitleFromHtml(html: string): string | null {
 function inferErrorCode(msg = '', status = 0): AuditErrorCode {
   const m = msg.toLowerCase();
 
+  if (m.includes('scan record') && (m.includes('not found') || status === 404)) {
+    return 'SCAN_NOT_FOUND';
+  }
   if (m.includes('ssrf') || m.includes('private') || m.includes('loopback') || m.includes('prohibited') || m.includes('link-local')) {
     return 'SSRF_BLOCKED';
+  }
+  if (m.includes('dns') || m.includes('enotfound') || m.includes('getaddrinfo')) {
+    return 'DNS_ERROR';
+  }
+  if (m.includes('redirect') || m.includes('too many redirects')) {
+    return 'TARGET_REDIRECT_ERROR';
+  }
+  if (m.includes('target returned http') || m.includes('404') || m.includes('500') || m.includes('502') || m.includes('503')) {
+    return 'TARGET_HTTP_ERROR';
   }
   if (m.includes('invalid url') || m.includes('protocol') || m.includes('malformed') || status === 400) {
     return 'INVALID_URL';
@@ -329,7 +341,7 @@ function inferErrorCode(msg = '', status = 0): AuditErrorCode {
   if (m.includes('denied') || m.includes('unauthorized') || m.includes('forbidden') || m.includes('cloudflare') || m.includes('bot') || status === 401 || status === 403) {
     return 'ACCESS_DENIED';
   }
-  if (m.includes('unreachable') || m.includes('enotfound') || m.includes('econnrefused') || m.includes('cannot be loaded') || m.includes('did not respond') || status === 502) {
+  if (m.includes('unreachable') || m.includes('econnrefused') || m.includes('cannot be loaded') || m.includes('did not respond')) {
     return 'TARGET_UNREACHABLE';
   }
   if (m.includes('axe') || m.includes('rule') || m.includes('scoring') || m.includes('wcag')) {
@@ -351,12 +363,24 @@ function getDefaultUserMessage(code?: AuditErrorCode, fallback = '', targetUrl?:
       return `The target URL provided is invalid or uses an unsupported protocol.`;
     case 'SSRF_BLOCKED':
       return `The requested address is blocked for security (private IPs, localhost, or cloud metadata endpoints).`;
+    case 'DNS_ERROR':
+      return `Domain Name Resolution (DNS) failed for "${targetUrl || 'the target host'}". Verify that the domain name is registered and active.`;
+    case 'TARGET_HTTP_ERROR':
+      return `The target website${target} returned an HTTP error response (such as 404 Not Found or 500 Internal Error).`;
+    case 'TARGET_REDIRECT_ERROR':
+      return `The target website${target} entered an infinite redirect loop or exceeded maximum allowed hops.`;
     case 'TARGET_UNREACHABLE':
-      return `Could not connect to the target website${target}. The host is offline, unreachable, or DNS lookup failed.`;
+      return `Could not connect to the target website${target}. The host is offline, unreachable, or refused connections.`;
     case 'TARGET_TIMEOUT':
       return `The target website${target} took too long to respond (connection timed out).`;
     case 'ACCESS_DENIED':
       return `Access to the target website${target} was denied (HTTP 401/403 or bot firewall block).`;
+    case 'SCAN_NOT_FOUND':
+      return `The requested audit scan record could not be found.`;
+    case 'QUEUE_ERROR':
+      return `The scan queue encountered an internal error while starting background audit workers.`;
+    case 'DATABASE_ERROR':
+      return `Database storage operation failed while saving or retrieving scan data.`;
     case 'BROWSER_ERROR':
       return `Browser DOM extraction encountered an unexpected error.`;
     case 'CRAWLER_ERROR':
@@ -375,12 +399,22 @@ function getDefaultSuggestion(code?: AuditErrorCode): string {
       return 'Please enter a valid, fully-qualified URL starting with https:// or http:// (e.g., https://example.com).';
     case 'SSRF_BLOCKED':
       return 'Ensure the target website is publicly accessible on the internet and not on a private local network.';
+    case 'DNS_ERROR':
+      return 'Check spelling of the domain name and confirm that DNS records (A/AAAA) are propagated.';
+    case 'TARGET_HTTP_ERROR':
+      return 'Check if the target webpage exists in your browser and verify the URL path is correct.';
+    case 'TARGET_REDIRECT_ERROR':
+      return 'Verify if the site has misconfigured 301/302 redirect rules or try accessing the final destination URL directly.';
     case 'TARGET_UNREACHABLE':
       return 'Verify that the website is online in your browser, uses a valid domain name, and is not blocking automated bots.';
     case 'TARGET_TIMEOUT':
       return 'The target server may be slow or overloaded. Try running a Quick Scan on a single page or test again in a few moments.';
     case 'ACCESS_DENIED':
       return 'The website requires user authentication or employs bot protection (e.g. Cloudflare Turnstile/WAF).';
+    case 'SCAN_NOT_FOUND':
+      return 'Start a new website scan from the audit input above.';
+    case 'QUEUE_ERROR':
+    case 'DATABASE_ERROR':
     case 'BROWSER_ERROR':
     case 'CRAWLER_ERROR':
     case 'AUDIT_ERROR':

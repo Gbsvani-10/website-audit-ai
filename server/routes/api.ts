@@ -5,11 +5,12 @@ import { explainAccessibilityIssue, generateRemediationFix, queryAccessibilityAs
 import {
   AuditException,
   createInvalidUrlError,
+  createScanNotFoundError,
   formatErrorResponse,
   normalizeToAuditException,
   logServerException,
 } from '../utils/errors.js';
-import type { ScanDepth, FullScanReport, ApiErrorDetail, AuditErrorCode } from '../../src/types/index.js';
+import type { ScanDepth, FullScanReport, ApiErrorDetail, AuditErrorCode, ScanLogEntry } from '../../src/types/index.js';
 
 export const apiRouter = Router();
 
@@ -53,7 +54,60 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
     const scanDepth = (depth as ScanDepth) || 'quick';
     const tempId = `scan_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-    // Set initial active state
+    // Initial URL parse for domain
+    let domain = trimmedUrl;
+    try {
+      const parsed = new URL(trimmedUrl.startsWith('http') ? trimmedUrl : `https://${trimmedUrl}`);
+      domain = parsed.hostname;
+    } catch {
+      // ignore
+    }
+    const websiteId = `site_${domain.replace(/[^a-z0-9]/gi, '_')}`;
+
+    const initialLog: ScanLogEntry = {
+      timestamp: new Date().toISOString(),
+      message: `Queued audit scan for ${trimmedUrl}`,
+      type: 'info',
+    };
+
+    // 1. Immediately create persistent record in dbStore so scan_id is guaranteed to exist
+    const initialReport: FullScanReport = {
+      id: tempId,
+      websiteId,
+      targetUrl: trimmedUrl,
+      domain,
+      status: 'initializing',
+      progressPercent: 5,
+      currentStepMessage: 'SSRF Security Validation: Initializing scan engine & security guard...',
+      scanDepth,
+      createdAt: new Date().toISOString(),
+      durationMs: 0,
+      scores: {
+        accessibility: 0,
+        performance: 0,
+        seo: 0,
+        security: 0,
+        overallQuality: 0,
+        breakdown: {
+          critical: 0,
+          serious: 0,
+          moderate: 0,
+          minor: 0,
+          passedChecks: 0,
+          incompleteChecks: 0,
+        },
+      },
+      pages: [],
+      issues: [],
+      seoSummary: [],
+      perfSummary: [],
+      securitySummary: [],
+      logs: [initialLog],
+    };
+
+    dbStore.saveScan(initialReport);
+
+    // 2. Set active in-memory record
     activeScans.set(tempId, {
       id: tempId,
       targetUrl: trimmedUrl,
@@ -61,12 +115,12 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
       progressPercent: 5,
       stepMessage: 'SSRF Security Validation: Initializing scan engine & security guard...',
       stage: 'SSRF Security Validation',
-      logs: [{ timestamp: new Date().toISOString(), message: `Queued scan for ${trimmedUrl}`, type: 'info' }],
+      logs: [initialLog],
       pagesDone: 0,
       totalPages: scanDepth === 'quick' ? 1 : scanDepth === 'standard' ? 10 : 30,
     });
 
-    // Start asynchronous crawler
+    // 3. Start asynchronous background scan
     (async () => {
       try {
         const fullReport = await crawlAndAuditWebsite(trimmedUrl, {
@@ -82,10 +136,19 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
               current.totalPages = p.totalPages;
               current.status = p.percent >= 100 ? 'completed' : 'analyzing';
             }
+
+            // Keep persistent record updated with progress
+            const dbRec = dbStore.getScan(tempId);
+            if (dbRec) {
+              dbRec.progressPercent = p.percent;
+              dbRec.currentStepMessage = p.stepMessage;
+              dbRec.logs.push(p.log);
+              dbStore.saveScan(dbRec);
+            }
           },
         });
 
-        // Store into DB
+        // Store completed report into DB
         fullReport.id = tempId;
         dbStore.saveScan(fullReport);
 
@@ -113,19 +176,18 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
           });
         }
 
-        // Save structured failed scan to store
+        // Save structured failed scan to persistent store
         try {
-          const domain = new URL(trimmedUrl.startsWith('http') ? trimmedUrl : `https://${trimmedUrl}`).hostname;
           const failedReport: FullScanReport = {
             id: tempId,
-            websiteId: `site_${domain.replace(/[^a-z0-9]/gi, '_')}`,
+            websiteId,
             targetUrl: trimmedUrl,
             domain,
             status: 'failed',
             progressPercent: 100,
             currentStepMessage: `Scan failed: ${auditErr.userFriendlyMessage}`,
             scanDepth,
-            createdAt: new Date().toISOString(),
+            createdAt: initialReport.createdAt,
             completedAt: new Date().toISOString(),
             durationMs: 0,
             scores: {
@@ -157,15 +219,18 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
           };
           dbStore.saveScan(failedReport);
         } catch {
-          // ignore fallback domain extraction errors
+          // ignore fallback
         }
       }
     })();
 
+    // 4. Return standard structured response
     return res.status(202).json({
       success: true,
+      scan_id: tempId,
       scanId: tempId,
       status: 'queued',
+      url: trimmedUrl,
       message: 'Scan initiated successfully.',
     });
   } catch (err: any) {
@@ -201,9 +266,11 @@ apiRouter.get('/scans/:scan_id', (req: Request, res: Response) => {
     if (stored) {
       return res.json({
         success: true,
+        scan_id: stored.id,
         scan: stored,
         isComplete: stored.status === 'completed' || stored.status === 'failed',
         isFailed: stored.status === 'failed',
+        status: stored.status,
       });
     }
 
@@ -215,6 +282,7 @@ apiRouter.get('/scans/:scan_id', (req: Request, res: Response) => {
 
       return res.json({
         success: true,
+        scan_id: active.id,
         scan: {
           id: active.id,
           targetUrl: active.targetUrl,
@@ -231,13 +299,15 @@ apiRouter.get('/scans/:scan_id', (req: Request, res: Response) => {
         },
         isComplete,
         isFailed,
+        status: active.status,
       });
     }
 
+    // Scan record truly not found
     return res.status(404).json(
       formatErrorResponse(
         new AuditException({
-          code: 'SERVER_ERROR',
+          code: 'SCAN_NOT_FOUND',
           statusCode: 404,
           message: `Scan record "${scan_id}" was not found.`,
           userFriendlyMessage: `Audit scan record "${scan_id}" was not found. It may have expired or been cleared.`,
@@ -260,16 +330,8 @@ apiRouter.get('/scans/:scan_id/summary', (req: Request, res: Response) => {
   try {
     const scan = dbStore.getScan(scan_id);
     if (!scan) {
-      return res.status(404).json(
-        formatErrorResponse(
-          new AuditException({
-            code: 'SERVER_ERROR',
-            statusCode: 404,
-            message: `Scan "${scan_id}" not found.`,
-            userFriendlyMessage: `Scan report "${scan_id}" could not be located.`,
-          })
-        )
-      );
+      const err = createScanNotFoundError(scan_id);
+      return res.status(err.statusCode).json(formatErrorResponse(err));
     }
 
     return res.json({
@@ -303,16 +365,8 @@ apiRouter.get('/scans/:scan_id/issues', (req: Request, res: Response) => {
   try {
     const scan = dbStore.getScan(scan_id);
     if (!scan) {
-      return res.status(404).json(
-        formatErrorResponse(
-          new AuditException({
-            code: 'SERVER_ERROR',
-            statusCode: 404,
-            message: `Scan "${scan_id}" not found.`,
-            userFriendlyMessage: `Scan record "${scan_id}" not found.`,
-          })
-        )
-      );
+      const err = createScanNotFoundError(scan_id);
+      return res.status(err.statusCode).json(formatErrorResponse(err));
     }
 
     let issues = [...(scan.issues || [])];

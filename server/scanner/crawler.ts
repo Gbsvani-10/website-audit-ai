@@ -10,6 +10,8 @@ import {
   createSsrfBlockedError,
   createTargetUnreachableError,
   createTargetTimeoutError,
+  createTargetHttpError,
+  createTargetRedirectError,
   createAccessDeniedError,
   createAuditError,
   createBrowserError,
@@ -37,6 +39,7 @@ const MAX_PAGES_BY_DEPTH: Record<ScanDepth, number> = {
 };
 
 const REQUEST_TIMEOUT_MS = 12000;
+const MAX_REDIRECT_HOPS = 5;
 
 export async function crawlAndAuditWebsite(
   targetUrl: string,
@@ -112,6 +115,12 @@ export async function crawlAndAuditWebsite(
   let rootSecurityObs: any[] = [];
   let rootSecurityScore = 85;
 
+  let primaryHttpStatus = 200;
+  let primaryRedirectChain: string[] = [validUrl];
+  let primaryFinalUrl = validUrl;
+  let primaryServerHeader: string | undefined;
+  let primaryContentType: string | undefined;
+
   let scannedCount = 0;
   let lastFetchError: Error | null = null;
 
@@ -135,34 +144,98 @@ export async function crawlAndAuditWebsite(
 
     try {
       const pageStart = Date.now();
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      
+      // Multi-hop safe redirect resolution with SSRF checks on every hop
+      let currentFetchUrl = currentUrl;
+      const redirectChain: string[] = [currentUrl];
+      let response: Response | null = null;
+      let hops = 0;
 
-      let response: Response;
-      try {
-        response = await fetch(currentUrl, {
-          signal: controller.signal,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (compatible; AccessAuditAI/1.0; +https://accessaudit.ai/bot)',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          },
-        });
-      } catch (fetchErr: any) {
-        clearTimeout(timeoutId);
-        if (fetchErr.name === 'AbortError') {
-          throw createTargetTimeoutError(
-            `Connection to ${currentUrl} timed out after ${REQUEST_TIMEOUT_MS}ms`,
-            fetchErr.stack,
-            currentUrl
+      while (hops < MAX_REDIRECT_HOPS) {
+        // Re-validate SSRF on redirect destination
+        const check = await validateSafeUrl(currentFetchUrl);
+        if (!check.valid || !check.normalizedUrl) {
+          throw createSsrfBlockedError(
+            `Redirection to prohibited or private destination blocked: ${currentFetchUrl}`,
+            undefined,
+            currentFetchUrl
           );
         }
-        throw createTargetUnreachableError(
-          `Network error connecting to ${currentUrl}: ${fetchErr.message}`,
-          fetchErr.stack,
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+        try {
+          response = await fetch(currentFetchUrl, {
+            redirect: 'manual',
+            signal: controller.signal,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 AccessAuditAI/1.0 (+https://accessaudit.ai/bot)',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9',
+            },
+          });
+        } catch (fetchErr: any) {
+          clearTimeout(timeoutId);
+          if (fetchErr.name === 'AbortError') {
+            throw createTargetTimeoutError(
+              `Connection to ${currentFetchUrl} timed out after ${REQUEST_TIMEOUT_MS}ms`,
+              fetchErr.stack,
+              currentFetchUrl
+            );
+          }
+          throw createTargetUnreachableError(
+            `Network error connecting to ${currentFetchUrl}: ${fetchErr.message}`,
+            fetchErr.stack,
+            currentFetchUrl
+          );
+        } finally {
+          clearTimeout(timeoutId);
+        }
+
+        if (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get('location');
+          if (!location) break;
+          const nextUrl = new URL(location, currentFetchUrl).toString();
+          redirectChain.push(nextUrl);
+          currentFetchUrl = nextUrl;
+          hops++;
+        } else {
+          break;
+        }
+      }
+
+      if (hops >= MAX_REDIRECT_HOPS) {
+        throw createTargetRedirectError(
+          `Target URL exceeded maximum redirection limit of ${MAX_REDIRECT_HOPS} hops.`,
+          undefined,
           currentUrl
         );
-      } finally {
-        clearTimeout(timeoutId);
+      }
+
+      if (!response) {
+        throw createTargetUnreachableError(`No HTTP response received from ${currentUrl}`, undefined, currentUrl);
+      }
+
+      const fetchDuration = Date.now() - pageStart;
+      totalHttpTime += fetchDuration;
+
+      if (scannedCount === 1) {
+        primaryHttpStatus = response.status;
+        primaryRedirectChain = redirectChain;
+        primaryFinalUrl = currentFetchUrl;
+        primaryServerHeader = response.headers.get('server') || undefined;
+        primaryContentType = response.headers.get('content-type') || undefined;
+      }
+
+      // Handle HTTP status codes on target
+      if (response.status === 404) {
+        if (scannedCount === 1) {
+          throw createTargetHttpError(404, `Target returned HTTP 404 (Not Found)`, undefined, currentUrl);
+        } else {
+          addLog(`Skipping ${currentUrl}: HTTP 404 Not Found`, 'warning');
+          continue;
+        }
       }
 
       if (response.status === 401 || response.status === 403 || response.status === 429) {
@@ -178,8 +251,19 @@ export async function crawlAndAuditWebsite(
         }
       }
 
-      const fetchDuration = Date.now() - pageStart;
-      totalHttpTime += fetchDuration;
+      if (response.status >= 500) {
+        if (scannedCount === 1) {
+          throw createTargetHttpError(
+            response.status,
+            `Target returned HTTP ${response.status} (${response.statusText || 'Server Error'})`,
+            undefined,
+            currentUrl
+          );
+        } else {
+          addLog(`Skipping ${currentUrl}: HTTP ${response.status} Server Error`, 'warning');
+          continue;
+        }
+      }
 
       const htmlText = await response.text();
       totalHtmlSize += htmlText.length;
@@ -397,6 +481,17 @@ export async function crawlAndAuditWebsite(
     perfSummary: pagesResults[0]?.perfMetrics || [],
     securitySummary: rootSecurityObs,
     logs,
+    httpStatus: primaryHttpStatus,
+    redirectChain: primaryRedirectChain,
+    finalUrl: primaryFinalUrl,
+    navigationMetadata: {
+      httpStatus: primaryHttpStatus,
+      redirectChain: primaryRedirectChain,
+      finalUrl: primaryFinalUrl,
+      serverHeader: primaryServerHeader,
+      contentType: primaryContentType,
+      loadTimeMs: pagesResults[0]?.loadTimeMs || 0,
+    },
     limitationsNotice:
       'Automated audit — manual testing and screen reader user verification may still be required for full WCAG compliance certification.',
   };

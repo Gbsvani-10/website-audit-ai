@@ -11,11 +11,17 @@ export type ScanStatus =
 export type AuditErrorCode =
   | 'INVALID_URL'
   | 'SSRF_BLOCKED'
+  | 'DNS_ERROR'
   | 'TARGET_UNREACHABLE'
   | 'TARGET_TIMEOUT'
+  | 'TARGET_HTTP_ERROR'
+  | 'TARGET_REDIRECT_ERROR'
   | 'ACCESS_DENIED'
   | 'BROWSER_ERROR'
   | 'CRAWLER_ERROR'
+  | 'SCAN_NOT_FOUND'
+  | 'QUEUE_ERROR'
+  | 'DATABASE_ERROR'
   | 'AUDIT_ERROR'
   | 'SERVER_ERROR';
 
@@ -173,6 +179,17 @@ export interface FullScanReport {
   perfSummary: PerformanceMetric[];
   securitySummary: SecurityObservation[];
   logs: ScanLogEntry[];
+  httpStatus?: number;
+  redirectChain?: string[];
+  finalUrl?: string;
+  navigationMetadata?: {
+    httpStatus: number;
+    redirectChain: string[];
+    finalUrl: string;
+    serverHeader?: string;
+    contentType?: string;
+    loadTimeMs?: number;
+  };
   errorMessage?: string;
   errorCode?: AuditErrorCode;
   errorDetail?: ApiErrorDetail;
