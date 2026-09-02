@@ -1,0 +1,6 @@
+{
+  "name": "AccessAudit AI",
+  "description": "Production website auditing, WCAG accessibility intelligence, SEO, performance, security analysis, and AI-powered remediation platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
